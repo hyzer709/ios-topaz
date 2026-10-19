@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 47160e2..2bbf786 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -842,6 +842,36 @@ touch_ginkgo(void)
+ 		int e = spi_packet(q, v, 2);
+ 		printf("SWEET TOUCH: status err=%d bytes=%02x %02x irq=%#x\n", e, v[0], v[1], st.irq_status);
+ 	}
++	/*
++	 * Diagnostic: is the IC alive but in its boot ROM (status bit0 = 0), or is
++	 * nothing answering on MISO? Pin config readback, then the boot-ROM ID read
++	 * (command 0x90, no length bytes, 2 data bytes + CRC). Read-only.
++	 */
++	for (unsigned pin = 6; pin <= 9; ++pin) {
++		printf("SWEET TOUCH: gpio%u cfg=%#x io=%#x\n", pin,
++		    touch_rd(st.west, TOUCH_GPIO_CFG(pin)), touch_rd(st.west, TOUCH_GPIO_IO(pin)));
++	}
++	{
++		static const uint8_t q[2] = {0x05, 0xff};
++		uint8_t v[2] = {0, 0}, rid[2] = {0, 0};
++		int idle = ETIMEDOUT, e = EIO;
++		for (unsigned i = 0; i < 100 && idle; ++i) {
++			delay(150);
++			if (spi_packet(q, v, 2) == 0 && (v[1] & 0x81u) == 0x00u) {
++				idle = 0;
++			}
++		}
++		if (!idle) {
++			static const uint8_t cmd[3] = {0xc0, 0xa0u | 1u, 0x90};
++			e = spi_packet(cmd, NULL, sizeof(cmd));
++			delay(1000);
++			if (!e) {
++				e = ft_data(rid, 2);
++			}
++		}
++		printf("SWEET TOUCH: romboot idle=%d id err=%d id=%02x %02x status=%02x %02x\n",
++		    idle, e, rid[0], rid[1], v[0], v[1]);
++	}
+ 	uint8_t id1 = 0, id2 = 0, fw = 0;
+ 	int e1 = ft_read_reg(0xa3, &id1, 1);
+ 	int e2 = ft_read_reg(0x9f, &id2, 1);
