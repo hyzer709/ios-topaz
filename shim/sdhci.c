@@ -64,6 +64,7 @@
 #define C_DATA		0x20
 
 /* Transfer mode */
+#define M_DMA		(1u << 0)
 #define M_BLKCNT	(1u << 1)
 #define M_ACMD12	(1u << 2)
 #define M_READ		(1u << 4)
@@ -230,6 +231,88 @@ static int read_lba1(const char *label)
 	return ok ? 0 : -1;
 }
 
+/*
+ * v3: 32-bit ADMA2 reads (the PIO path above costs ~1.5 us per 32-bit word,
+ * far too slow for an OS). MMU off, so this memory is Device and coherent.
+ * Descriptor: u16 attr (valid|end|act=tran), u16 length, u32 address.
+ */
+#define R_ADMA_ADDR	0x58
+#define R_ADMA_ADDR_HI	0x5c
+#define INT_ADMA_ERR	(1u << 25)
+#define ADMA_CHUNK	0x8000u
+#define BIG_SECTORS	2048u			/* 1 MiB */
+
+struct adma_desc { uint16_t attr, len; uint32_t addr; };
+static struct adma_desc adma_tbl[BIG_SECTORS * 512 / ADMA_CHUNK] __attribute__((aligned(8)));
+/* 1 MiB scratch in free DDR (System RAM 0x80000000+; nothing else runs here). */
+#define big ((uint8_t *)0x90000000UL)
+
+static int adma_read(uint32_t lba, uint32_t nblk, uint8_t *dst, uint32_t *st)
+{
+	uint32_t bytes = nblk * 512, n = 0;
+	for (uint32_t off = 0; off < bytes; off += ADMA_CHUNK, n++) {
+		uint32_t len = bytes - off < ADMA_CHUNK ? bytes - off : ADMA_CHUNK;
+		adma_tbl[n].attr = 0x21 | (off + len >= bytes ? 2 : 0);
+		adma_tbl[n].len = (uint16_t)len;
+		adma_tbl[n].addr = (uint32_t)(uintptr_t)(dst + off);
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+	*st = 0;
+	if (wait_idle(PS_CMD_INHIBIT | PS_DAT_INHIBIT))
+		return -3;
+	hc_wr(R_HOSTCTL, (hc_rd(R_HOSTCTL) & ~(3u << 3)) | (2u << 3));	/* 32-bit ADMA2 */
+	hc_wr(R_ADMA_ADDR, (uint32_t)(uintptr_t)adma_tbl);
+	hc_wr(R_ADMA_ADDR_HI, 0);
+	hc_wr(R_INT_STAT, 0xffffffff);
+	hc_wr(R_BLOCK, (nblk << 16) | 512);
+	hc_wr(R_ARG, lba);
+	hc_wr(R_XFER_CMD, ((18u << 8 | C_RESP48 | C_CRC | C_INDEX | C_DATA) << 16) |
+	      M_DMA | M_BLKCNT | M_ACMD12 | M_READ | M_MULTI);
+	int r = wait_int(INT_XFER_DONE, st);
+	hc_wr(R_INT_STAT, 0xffffffff);
+	hc_wr(R_HOSTCTL, hc_rd(R_HOSTCTL) & ~(3u << 3));
+	return r;
+}
+
+static uint32_t sum32(const void *p, uint32_t bytes)
+{
+	const uint32_t *w = p;
+	uint32_t s = 0;
+	for (uint32_t i = 0; i < bytes / 4; i++)
+		s = s * 31 + w[i];
+	return s;
+}
+
+static void test_adma(uint32_t entry_lba, uint32_t userdata_first)
+{
+	uint32_t st;
+	/* Same 32 GPT-entry sectors as the PIO read: the checksums must match. */
+	uint32_t pio_sum = sum32(buf, 32 * 512);
+	int e = adma_read(entry_lba, 32, big, &st);
+	if (e) {
+		con_hex2("ADMA", "failed e=", (uint32_t)e, "st=", st);
+		soft_reset_cmd_dat();
+		return;
+	}
+	uint32_t dma_sum = sum32(big, 32 * 512);
+	con_hex2("ADMA", "pio sum=", pio_sum, "dma sum=", dma_sum);
+	if (pio_sum != dma_sum) {
+		con_str("ADMA", "MISMATCH: DMA data differs from PIO");
+		return;
+	}
+	/* 1 MiB from the start of userdata, timed. */
+	uint64_t t0 = ticks();
+	e = adma_read(userdata_first, BIG_SECTORS, big, &st);
+	uint32_t us = (uint32_t)((ticks() - t0) * 10 / 192);
+	if (e) {
+		con_hex2("ADMA 1M", "failed e=", (uint32_t)e, "st=", st);
+		soft_reset_cmd_dat();
+		return;
+	}
+	con_hex2("ADMA 1M", "KiB/s=", us ? BIG_SECTORS * 512u / us * 1000u : 0, "us=", us);
+	con_str("ADMA", "OK: DMA reads work");
+}
+
 void test_sdhci(void)
 {
 	con_str("EMMC", "ginkgo sdhci probe v2 (no data writes)");
@@ -360,6 +443,7 @@ void test_sdhci(void)
 			con_hex2("USERDATA", "first=", (uint32_t)first, "last=", (uint32_t)end);
 			con_hex2("SPEED", "KiB/s=", us ? sectors * 512u * 1000u / us : 0, "us=", us);
 			con_str("EMMC", "OK: eMMC readable from our code");
+			test_adma((uint32_t)entry_lba + chunk * 32, (uint32_t)first);
 			return;
 		}
 	}
