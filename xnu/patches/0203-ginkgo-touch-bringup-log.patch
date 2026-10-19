@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ba01de4..0d3a8a1 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -821,9 +821,11 @@ static void
+ touch_ginkgo(void)
+ {
+ 	st.stage = "spi init";
++	printf("SWEET TOUCH: SPI init\n");
+ 	if (!spi_se_init()) {
+ 		return;
+ 	}
++	printf("SWEET TOUCH: SPI init done, pins next\n");
+ 	/* qup02 SPI pins (6 MISO, 7 MOSI, 8 CLK, 9 CS), 6 mA, no pull; IRQ input pull-up. */
+ 	for (unsigned pin = 6; pin <= 9; ++pin) {
+ 		touch_gpio(pin, 1, 0, 2, false, false);
+@@ -833,6 +835,13 @@ touch_ginkgo(void)
+ 	    touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_RESET)),
+ 	    touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_IRQ)));
+ 	st.stage = "probe";
++	printf("SWEET TOUCH: first SPI packet (status 05 ff)\n");
++	{
++		static const uint8_t q[2] = {0x05, 0xff};
++		uint8_t v[2] = {0, 0};
++		int e = spi_packet(q, v, 2);
++		printf("SWEET TOUCH: status err=%d bytes=%02x %02x irq=%#x\n", e, v[0], v[1], st.irq_status);
++	}
+ 	uint8_t id1 = 0, id2 = 0, fw = 0;
+ 	int e1 = ft_read_reg(0xa3, &id1, 1);
+ 	int e2 = ft_read_reg(0x9f, &id2, 1);
+@@ -970,7 +979,24 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks()) {
+ 		goto out;
+ 	}
+-	if (((touch_rd(st.se, SE_FW) >> 8) & 0xffu) == 1u) {
++	/* ginkgo bring-up: one line per risky access (a bus stall freezes the SoC). */
++	printf("SWEET TOUCH: clocks on: vote=%#x cfg=%#x cbcr=%#x\n",
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG + 4u),
++	    touch_rd(st.gcc, TOUCH_RCG - 4u));
++	{
++		int stop = 0;
++		(void)PE_parse_boot_argn("sweettouchstop", &stop, sizeof(stop));
++		if (stop == 1) {
++			printf("SWEET TOUCH: sweettouchstop=1, not touching SE2\n");
++			goto out;
++		}
++	}
++	printf("SWEET TOUCH: reading SE2 fw (0x4a88068)\n");
++	delay(20000);
++	uint32_t se_fw = touch_rd(st.se, SE_FW);
++	printf("SWEET TOUCH: SE2 fw=%#x proto=%u status=%#x\n",
++	    se_fw, (se_fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS));
++	if (((se_fw >> 8) & 0xffu) == 1u) {
+ 		touch_ginkgo();         /* SE2 loaded as SPI: ginkgo FT8719 */
+ 		goto out;
+ 	}
