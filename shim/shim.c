@@ -11,6 +11,9 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#ifdef GINKGO
+#include "sdhci.h"
+#endif
 
 #define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -295,6 +298,11 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		delay_ms(1000);
 		con_skip();
 		con_str("LOADER", loader_boot(dtb));
+#ifdef GINKGO
+		/* No xnu payload: probe the eMMC instead (read-only). */
+		con_skip();
+		test_sdhci();
+#endif
 	}
 	for (;;)
 		__asm__ volatile("wfe");
