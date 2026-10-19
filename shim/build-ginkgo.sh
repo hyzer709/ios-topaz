@@ -3,7 +3,8 @@
 # Differences from build.sh (topaz): -DGINKGO (panel 1080x2340, no UFS probe,
 # no topaz-only cpufreq/IMEM/PS_HOLD writes) and a boot image *v2* with the
 # stock DTB, because the ginkgo ABL boots v2 images (stock boot.img is v2).
-# Milestone 1 only: no xnu payload, just the shim screen and the gold hand-off.
+# Without an argument: shim screen and gold hand-off only. With a payload
+# (./build-ginkgo.sh ../shim/out/payload.bin): boot xnu.
 set -euo pipefail
 cd "$(dirname "$0")"
 DTB=${DTB:-../dtb/boot_unpacked/dtb}
@@ -22,6 +23,13 @@ $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -W
 $OBJCOPY -O binary out/shim.elf out/Image
 size=$((16#$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')))
 truncate -s "$size" out/Image
+# Optional xnu payload (tools/mkpayload.py) as $1: appended to the Image at the
+# first 4K boundary after _end, where loader.c looks first, as on topaz.
+if [ -n "${1:-}" ]; then
+	truncate -s $(( (size + 0xfff) & ~0xfff )) out/Image
+	cat "$1" >> out/Image
+	python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
+fi
 (cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 # Same layout as the stock ginkgo boot.img header (base 0, kernel 0x8000,
 # tags 0x100, dtb 0x1f00000, page 4096).

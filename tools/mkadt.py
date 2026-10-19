@@ -23,6 +23,11 @@ HIGH_MEM_SIZE = 0x100000000
 # gives the kernel RAM below 4 GiB, which the GPU needs (it does not reach above).
 MID_PHYS_BASE = int(__import__("os").environ.get("MIDBASE", "0x80000000"), 16)
 MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
+# --ginkgo: Redmi Note 8 (SM6125 trinket, 4 GB). /proc/iomem on the phone shows
+# System RAM 0x80000000-0x13fffffff as one block (3 GiB) and no RAM at
+# 0x1_40000000, so the kernel gets that block. Panel 1080x2340, eMMC (no UFS).
+GINKGO_PHYS_BASE, GINKGO_MEM_SIZE = 0x80000000, 0xc0000000
+GINKGO_FB_H = 2340
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -76,10 +81,13 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, ginkgo=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
+    if ginkgo:
+        phys_base, mem_size = GINKGO_PHYS_BASE, GINKGO_MEM_SIZE
+    fb_h = GINKGO_FB_H if ginkgo else FB_H
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -196,7 +204,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ph(),
         ('reg', u64(FB, FB_SIZE)),
         ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
+        ('height', u32(fb_h)),
         ('stride', u32(FB_STRIDE)),
     ])
 
@@ -238,12 +246,13 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or ginkgo else [ufs]))
 
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 ginkgo='--ginkgo' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
