@@ -109,10 +109,14 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
+#ifndef GINKGO
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+#endif
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-	wr32(PSHOLD, 0);
+#ifndef GINKGO
+	wr32(PSHOLD, 0);	/* topaz address */
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -244,7 +248,7 @@ static uint64_t speed_ticks(void)
  * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
  * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
  */
-static void gold_cpufreq_max(void)
+static void __attribute__((unused)) gold_cpufreq_max(void)
 {
 	uintptr_t b = 0x0f523000;
 	uint32_t best = 0, best_khz = 0, prev = 0;
@@ -283,7 +287,9 @@ static void __attribute__((noreturn)) gold_main(uint64_t dtb)
 		 */
 		test_gic();
 		gold_gicr_prepare();
-		gold_cpufreq_max();
+#ifndef GINKGO
+		gold_cpufreq_max();	/* topaz cpufreq-hw address; unverified on trinket */
+#endif
 		uint64_t gt = speed_ticks();
 		con_hex2("SPEED", "silver=", (uint32_t)silver_ticks, "gold=", (uint32_t)gt);
 		delay_ms(1000);
@@ -532,6 +538,12 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
+#ifdef GINKGO
+	/* ginkgo boots from eMMC (sdhci@4744000): there is no UFS to probe. */
+	con_str("GINKGO", "no gold hand-off; holding screen");
+	delay_ms(180000);
+	reset(20);
+#endif
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
 	test_ufs();

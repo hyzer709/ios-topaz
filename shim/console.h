@@ -3,7 +3,11 @@
 
 #define FB_BASE		0x5c000000UL	/* reserved-memory cont_splash_region */
 #define FB_W		1080
+#ifdef GINKGO
+#define FB_H		2340	/* Redmi Note 8 (ginkgo) panel */
+#else
 #define FB_H		2400
+#endif
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
 
 #define RED	0xffff0000U
