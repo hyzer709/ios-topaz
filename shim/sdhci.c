@@ -8,7 +8,11 @@
  *   CMD13 SEND_STATUS   - find the card's RCA and check it is in TRAN state
  *   CMD17 READ_SINGLE   - LBA 1, must start with "EFI PART"
  *   CMD18 READ_MULTIPLE - the GPT entries, look for "userdata"
- * Nothing is ever written to the card: there is no CMD24/CMD25/CMD6 here.
+ * v2: ABL leaves the host with the SD clock off, bus power off and a 1-bit bus,
+ * so the probe re-initializes the card (CMD0/1/2/3/7, then CMD6 to switch the
+ * bus to 8-bit high speed). CMD6 only changes the card's volatile bus settings
+ * (EXT_CSD BUS_WIDTH/HS_TIMING); no user data is ever written: there is no
+ * CMD24/CMD25 in this file.
  *
  * Register layout: SD Host Controller Simplified Specification 3.00.
  * Every register access is 32 bits wide.
@@ -38,6 +42,11 @@
 
 #define CQ_CFG		0x08
 
+/* sdhci-msm v5 vendor power-control handshake (offsets from hc_mem) */
+#define R_PWRCTL_STATUS	0x240
+#define R_PWRCTL_CLEAR	0x248
+#define R_PWRCTL_CTL	0x24c
+
 #define PS_CMD_INHIBIT	(1u << 0)
 #define PS_DAT_INHIBIT	(1u << 1)
 
@@ -47,7 +56,9 @@
 #define INT_ERROR	(1u << 15)
 
 /* Command register: index << 8 | flags */
+#define C_RESP136	0x01
 #define C_RESP48	0x02
+#define C_RESP48B	0x03
 #define C_CRC		0x08
 #define C_INDEX		0x10
 #define C_DATA		0x20
@@ -148,82 +159,194 @@ static uint64_t le64(const uint8_t *p)
 	return v;
 }
 
+static void delay_us(uint32_t us)
+{
+	uint64_t end = ticks() + (uint64_t)us * 192 / 10;
+	while (ticks() < end)
+		;
+}
+
+/*
+ * The msm host raises a power-control request whenever bus power or a full
+ * reset is written and waits for software to acknowledge it (Linux:
+ * sdhci_msm_handle_pwr_irq). The regulators are already on here, so just
+ * report success for whatever was requested.
+ */
+static uint32_t pwrctl_ack(void)
+{
+	uint64_t end = ticks() + TIMEOUT_TICKS / 5;
+	uint32_t st;
+	while (!(st = hc_rd(R_PWRCTL_STATUS)))
+		if (ticks() > end)
+			return 0;
+	hc_wr(R_PWRCTL_CLEAR, st);
+	uint32_t ok = 0;
+	if (st & 3)		/* BUS_OFF / BUS_ON */
+		ok |= 1;
+	if (st & 0xc)		/* IO_LOW / IO_HIGH */
+		ok |= 4;
+	hc_wr(R_PWRCTL_CTL, ok);
+	return st;
+}
+
+/* SD clock = base / (2 * div); div 0 = base. */
+static void set_clock(uint32_t div)
+{
+	uint32_t c = hc_rd(R_CLOCK) & ~0xffffu;
+	hc_wr(R_CLOCK, c | (div & 0xff) << 8 | ((div >> 8) & 3) << 6 | 1);
+	uint64_t end = ticks() + TIMEOUT_TICKS;
+	while (!(hc_rd(R_CLOCK) & 2))
+		if (ticks() > end)
+			break;
+	hc_wr(R_CLOCK, hc_rd(R_CLOCK) | 4);
+	delay_us(1000);
+}
+
+/* Wait for the end of a busy signal on DAT0 (R1b commands). */
+static void wait_busy(void)
+{
+	uint32_t st;
+	(void)wait_int(INT_XFER_DONE, &st);
+	hc_wr(R_INT_STAT, 0xffffffff);
+	uint64_t end = ticks() + TIMEOUT_TICKS;
+	while (!(hc_rd(R_PRESENT) & (1u << 20)))
+		if (ticks() > end)
+			break;
+}
+
+static int read_lba1(const char *label)
+{
+	uint32_t resp, st;
+	int e = cmd(17, 1, C_RESP48 | C_CRC | C_INDEX | C_DATA, M_BLKCNT | M_READ, 1, &resp, &st);
+	if (e) {
+		con_hex2(label, "CMD17 e=", (uint32_t)e, "st=", st);
+		soft_reset_cmd_dat();
+		return -1;
+	}
+	const uint8_t *b = (const uint8_t *)buf;
+	int ok = b[0] == 'E' && b[1] == 'F' && b[2] == 'I' && b[3] == ' ' &&
+		 b[4] == 'P' && b[5] == 'A' && b[6] == 'R' && b[7] == 'T';
+	con_hex2(label, ok ? "EFI PART w0=" : "no GPT w0=", buf[0], "w1=", buf[1]);
+	return ok ? 0 : -1;
+}
+
 void test_sdhci(void)
 {
-	con_str("EMMC", "ginkgo sdhci@4744000 probe (read-only, PIO)");
+	con_str("EMMC", "ginkgo sdhci probe v2 (no data writes)");
 	uint32_t ver = hc_rd(R_VERSION);
-	uint32_t present = hc_rd(R_PRESENT), clock = hc_rd(R_CLOCK);
-	con_hex2("HC", "ver=", ver, "present=", present);
-	con_hex2("HC", "hostctl=", hc_rd(R_HOSTCTL), "clock=", clock);
-	con_hex2("HC", "ctrl2=", hc_rd(R_CTRL2), "caps=", hc_rd(R_CAPS));
-	con_hex2("HC", "int_en=", hc_rd(R_INT_EN), "sig_en=", hc_rd(R_SIG_EN));
-	con_hex2("CQ", "cfg=", *(volatile uint32_t *)(CQ_BASE + CQ_CFG), "ver=",
-		 *(volatile uint32_t *)(CQ_BASE + 0));
+	con_hex2("HC", "ver=", ver, "present=", hc_rd(R_PRESENT));
+	con_hex2("HC", "hostctl=", hc_rd(R_HOSTCTL), "clock=", hc_rd(R_CLOCK));
+	con_hex2("HC", "pwrctl=", hc_rd(R_PWRCTL_STATUS), "caps=", hc_rd(R_CAPS));
 	if (ver == 0 || ver == 0xffffffff) {
 		con_str("EMMC", "registers read as 0/ff: host clocks off?");
-		return;
-	}
-	if (!(clock & (1u << 2))) {
-		con_str("EMMC", "SD clock is off: ABL turned the card clock down");
 		return;
 	}
 	if (*(volatile uint32_t *)(CQ_BASE + CQ_CFG) & 1) {
 		con_str("EMMC", "command queue engine is ON: stopping");
 		return;
 	}
+	uint32_t base_mhz = (hc_rd(R_CAPS) >> 8) & 0xff;
+	if (!base_mhz)
+		base_mhz = 200;
 
-	/* Latch every status bit, signal none (polled). */
-	hc_wr(R_INT_EN, 0xffff00ff & ~0x100u);	/* not card interrupt */
+	hc_wr(R_INT_EN, 0xffff00ff & ~0x100u);
 	hc_wr(R_SIG_EN, 0);
 	hc_wr(R_INT_STAT, 0xffffffff);
 
-	/* CMD13 with the RCAs a bootloader is likely to have assigned. */
+	/* Bus power on (1.8 V signalling setting), acknowledged to the msm core. */
+	uint32_t hc = hc_rd(R_HOSTCTL);
+	if (!(hc & (1u << 8))) {
+		hc_wr(R_HOSTCTL, (hc & ~0xff00u) | (0x0bu << 8));
+		con_hex2("POWER", "on, pwrctl=", pwrctl_ack(), "hostctl=", hc_rd(R_HOSTCTL));
+	}
+	/* Data timeout: max. Identification clock: 400 kHz. */
+	hc_wr(R_CLOCK, (hc_rd(R_CLOCK) & ~(0xffu << 16)) | (0x0eu << 16));
+	set_clock(base_mhz * 1000 / 800);		/* base / (2 * div) = 400 kHz */
+	con_hex2("CLOCK", "400k reg=", hc_rd(R_CLOCK), "present=", hc_rd(R_PRESENT));
+
+	/* Is the card still selected from ABL? (diagnostic only) */
 	uint32_t resp = 0, st = 0, rca = 0;
 	for (uint32_t r = 1; r <= 4 && !rca; r++) {
-		int e = cmd(13, r << 16, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st);
-		if (e == 0) {
+		if (cmd(13, r << 16, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st) == 0)
 			rca = r;
-		} else {
+		else
 			soft_reset_cmd_dat();
-		}
 	}
-	if (!rca) {
-		con_hex2("CMD13", "no answer st=", st, "resp=", resp);
-		return;
-	}
-	con_hex2("CMD13", "rca=", rca, "status=", resp);
-	con_hex2("CARD", "state=", (resp >> 9) & 0xf, "(4=tran) err=", resp & 0xfff80000u);
+	if (rca)
+		con_hex2("CMD13", "rca=", rca, "state=", (resp >> 9) & 0xf);
+	else
+		con_hex2("CMD13", "no answer st=", st, "rca=", 0);
 
-	/* CMD17: LBA 1 = GPT header (byte addressing would show garbage). */
-	int e = cmd(17, 1, C_RESP48 | C_CRC | C_INDEX | C_DATA, M_BLKCNT | M_READ, 1, &resp, &st);
-	if (e) {
-		con_hex2("CMD17", "failed e=", (uint32_t)e, "st=", st);
+	/* Full identification: CMD0, CMD1 until ready, CMD2, CMD3 (RCA 1), CMD7. */
+	(void)cmd(0, 0, 0, 0, 0, &resp, &st);
+	delay_us(2000);
+	uint32_t ocr = 0;
+	for (int i = 0; i < 1000; i++) {
+		if (cmd(1, 0x40ff8080, C_RESP48, 0, 0, &ocr, &st) != 0) {
+			soft_reset_cmd_dat();
+			ocr = 0;
+		}
+		if (ocr & (1u << 31))
+			break;
+		delay_us(1000);
+	}
+	con_hex2("CMD1", "ocr=", ocr, "st=", st);
+	if (!(ocr & (1u << 31))) {
+		con_str("EMMC", "card did not power up (no OCR ready)");
+		return;
+	}
+	if (cmd(2, 0, C_RESP136 | C_CRC, 0, 0, &resp, &st)) {
+		con_hex2("CMD2", "failed st=", st, "", 0);
+		return;
+	}
+	con_hex2("CID", "w0=", resp, "w1=", hc_rd(R_RESP0 + 4));
+	if (cmd(3, 1u << 16, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st) ||
+	    cmd(7, 1u << 16, C_RESP48B | C_CRC | C_INDEX, 0, 0, &resp, &st)) {
+		con_hex2("CMD3/7", "failed st=", st, "resp=", resp);
+		return;
+	}
+	wait_busy();
+	(void)cmd(13, 1u << 16, C_RESP48 | C_CRC | C_INDEX, 0, 0, &resp, &st);
+	con_hex2("SELECTED", "rca=", 1, "state=", (resp >> 9) & 0xf);
+
+	if (read_lba1("LBA1 slow"))
+		return;
+
+	/* 8-bit bus, high speed (52 MHz SDR): EXT_CSD BUS_WIDTH=2, HS_TIMING=1. */
+	if (cmd(6, 3u << 24 | 183u << 16 | 2u << 8, C_RESP48B | C_CRC | C_INDEX, 0, 0, &resp, &st) == 0) {
+		wait_busy();
+		hc_wr(R_HOSTCTL, hc_rd(R_HOSTCTL) | (1u << 5));		/* 8-bit */
+	} else {
 		soft_reset_cmd_dat();
-		return;
 	}
+	if (cmd(6, 3u << 24 | 185u << 16 | 1u << 8, C_RESP48B | C_CRC | C_INDEX, 0, 0, &resp, &st) == 0) {
+		wait_busy();
+		hc_wr(R_HOSTCTL, hc_rd(R_HOSTCTL) | (1u << 2));		/* high speed */
+		set_clock(base_mhz / 100);			/* base / (2 * div) = 50 MHz */
+	} else {
+		soft_reset_cmd_dat();
+	}
+	con_hex2("FAST", "hostctl=", hc_rd(R_HOSTCTL), "clock=", hc_rd(R_CLOCK));
+	if (read_lba1("LBA1 fast"))
+		return;
+
 	const uint8_t *b = (const uint8_t *)buf;
-	con_hex2("LBA1", "w0=", buf[0], "w1=", buf[1]);
-	if (!(b[0] == 'E' && b[1] == 'F' && b[2] == 'I' && b[3] == ' ' &&
-	      b[4] == 'P' && b[5] == 'A' && b[6] == 'R' && b[7] == 'T')) {
-		con_str("GPT", "no EFI PART at LBA 1");
-		return;
-	}
-	uint64_t entry_lba = le64(b + 72), last = le64(b + 32);
+	uint64_t entry_lba = le64(b + 72);
 	uint32_t nent = b[80] | b[81] << 8 | b[82] << 16 | (uint32_t)b[83] << 24;
-	con_str("GPT", "EFI PART found");
 	con_hex2("GPT", "entries@", (uint32_t)entry_lba, "n=", nent);
-	con_hex("GPT backup", last);
 
 	/* CMD18 + auto CMD12: the GPT entries, 4 per sector, until "userdata". */
 	uint64_t t0 = ticks();
+	uint32_t sectors = 0;
 	for (uint32_t chunk = 0; chunk * 128 < nent && chunk < 8; chunk++) {
-		e = cmd(18, (uint32_t)entry_lba + chunk * 32, C_RESP48 | C_CRC | C_INDEX | C_DATA,
+		int e = cmd(18, (uint32_t)entry_lba + chunk * 32, C_RESP48 | C_CRC | C_INDEX | C_DATA,
 			M_BLKCNT | M_ACMD12 | M_READ | M_MULTI, 32, &resp, &st);
 		if (e) {
 			con_hex2("CMD18", "failed e=", (uint32_t)e, "st=", st);
 			soft_reset_cmd_dat();
 			return;
 		}
+		sectors += 32;
 		for (int i = 0; i < 128; i++) {
 			const uint8_t *ent = b + i * 128;
 			const char *want = "userdata";
@@ -232,10 +355,10 @@ void test_sdhci(void)
 				c++;
 			if (want[c] || ent[56 + 2 * c] != 0)
 				continue;
+			uint32_t us = (uint32_t)((ticks() - t0) * 10 / 192);
 			uint64_t first = le64(ent + 32), end = le64(ent + 40);
 			con_hex2("USERDATA", "first=", (uint32_t)first, "last=", (uint32_t)end);
-			con_hex2("USERDATA", "MiB=", (uint32_t)((end - first + 1) >> 11),
-				 "read us=", (uint32_t)((ticks() - t0) * 10 / 192));
+			con_hex2("SPEED", "KiB/s=", us ? sectors * 512u * 1000u / us : 0, "us=", us);
 			con_str("EMMC", "OK: eMMC readable from our code");
 			return;
 		}
