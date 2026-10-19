@@ -1,0 +1,355 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ff9d858..ba01de4 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -548,6 +548,339 @@ touch_focaltech(void)
+ 	return 0;
+ }
+ 
++
++/*
++ * ginkgo (Redmi Note 8, SM6125): FocalTech FT8719 TDDI touch on QUP0 SE2 in
++ * SPI mode (spi@4a88000, CS0, SPI mode 1, <= 8 MHz), IRQ GPIO88, reset GPIO87,
++ * all on the WEST tile like topaz. Selected automatically when the SE2
++ * firmware ABL/TZ loaded is SPI (protocol 1) instead of I2C (3).
++ *
++ * Protocol (Xiaomi ginkgo-q-oss focaltech_spi.c, "FTS SPI v2"):
++ *   status: 05 ff                      -> 2nd byte, bit0 = FW running, bit7 = busy
++ *   command: c0 <ctrl|len> <reg> <len_hi> <len_lo>   (ctrl a0 = read + CRC)
++ *   data:    3f ff.. (len + 2 CRC bytes clocked in)  CRC-16/KERMIT, LSB first
++ * A touch frame is a data packet with no command, 90 bytes, laid out like the
++ * I2C registers from 0x01 (frame[1] = TD_STATUS ... records from frame[2]).
++ * Every packet is one chip-select assertion: first byte, 30 us, the rest.
++ */
++#define SPI_CPHA          0x224u
++#define SPI_LOOPBACK      0x22cu
++#define SPI_CPOL          0x230u
++#define SPI_DEMUX_INV     0x24cu
++#define SPI_DEMUX_SEL     0x250u
++#define SPI_TRANS_CFG     0x25cu
++#define SPI_WORD_LEN      0x268u
++#define SPI_TX_LEN        0x26cu
++#define SPI_RX_LEN        0x270u
++#define SPI_DELAYS        0x278u
++#define SPI_FULL_DUPLEX   3u
++#define SPI_FRAGMENT      4u
++#define SPI_CHUNK         32u
++#define FT_PIN_RESET      87u
++#define FT_PIN_IRQ        88u
++#define FT_FRAME          90u
++#define FT_PANEL_W        1080
++#define FT_PANEL_H        2340
++
++static int
++spi_chunk(const uint8_t *tx, uint8_t *rx, unsigned len, bool more)
++{
++	if (st.dead || len == 0 || len > SPI_CHUNK) {
++		return EIO;
++	}
++	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
++		st.dead = true;
++		return EBUSY;
++	}
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, SPI_TRANS_CFG, 0);              /* no CS toggle between words */
++	touch_wr(st.se, SPI_TX_LEN, len);               /* 8-bit words */
++	touch_wr(st.se, SPI_RX_LEN, len);
++	touch_wr(st.se, SE_TX_WM, 1);
++	touch_wr(st.se, SE_CMD, (SPI_FULL_DUPLEX << 27) | (more ? SPI_FRAGMENT : 0u));
++	bool sent = false;
++	unsigned got = 0;
++	for (unsigned i = 0; i < 5000; ++i) {
++		uint32_t irq = touch_irq();
++		if (irq & SE_ERRORS) {
++			break;
++		}
++		if (!sent && (irq & SE_TX_WM_IRQ)) {
++			for (unsigned off = 0; off < len; off += 4) {
++				uint32_t word = 0;
++				for (unsigned j = 0; j < 4 && off + j < len; ++j) {
++					word |= (uint32_t)tx[off + j] << (8u * j);
++				}
++				touch_wr(st.se, SE_TX, word);
++			}
++			touch_wr(st.se, SE_TX_WM, 0);
++			sent = true;
++		}
++		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
++		if (count > 16) {
++			break;
++		}
++		while (count--) {
++			uint32_t word = touch_rd(st.se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < len; ++j, ++got) {
++				if (rx) {
++					rx[got] = (uint8_t)(word >> (8u * j));
++				}
++			}
++		}
++		if (irq & SE_DONE) {
++			irq = touch_irq();
++			touch_wr(st.se, SE_IRQ_CLR, irq);
++			if (!(irq & SE_ERRORS) && sent && got == len) {
++				return 0;
++			}
++			break;
++		}
++		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
++		delay(1);
++	}
++	touch_abort();
++	return EIO;
++}
++
++/* One FTS packet: one CS assertion, 30 us after the first byte, 150 us after. */
++static int
++spi_packet(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	int err = spi_chunk(tx, rx, 1, len > 1);
++	if (!err && len > 1) {
++		delay(30);
++		for (unsigned off = 1; off < len && !err; off += SPI_CHUNK) {
++			unsigned n = len - off < SPI_CHUNK ? len - off : SPI_CHUNK;
++			err = spi_chunk(tx + off, rx ? rx + off : NULL, n, off + n < len);
++		}
++	}
++	delay(150);
++	return err;
++}
++
++static uint16_t
++ft_crc(const uint8_t *p, unsigned n)
++{
++	uint16_t crc = 0xffff;
++	for (unsigned i = 0; i < n; ++i) {
++		crc ^= p[i];
++		for (unsigned b = 0; b < 8; ++b) {
++			crc = (crc & 1u) ? (uint16_t)((crc >> 1) ^ 0x8408u) : (uint16_t)(crc >> 1);
++		}
++	}
++	return crc;
++}
++
++static int
++ft_wait_idle(void)
++{
++	static const uint8_t cmd[2] = {0x05, 0xff};
++	uint8_t v[2];
++	for (unsigned i = 0; i < 100; ++i) {
++		delay(150);
++		if (spi_packet(cmd, v, 2) == 0 && (v[1] & 0x81u) == 0x01u) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/* Data packet: 3f, then len data bytes and 2 CRC bytes clocked in. */
++static int
++ft_data(uint8_t *out, unsigned len)
++{
++	uint8_t tx[FT_FRAME + 3], rx[FT_FRAME + 3];
++	if (len > FT_FRAME) {
++		return EINVAL;
++	}
++	memset(tx, 0xff, sizeof(tx));
++	tx[0] = 0x3f;
++	int err = spi_packet(tx, rx, len + 3u);
++	if (err) {
++		return err;
++	}
++	uint16_t want = (uint16_t)(rx[len + 1] | (rx[len + 2] << 8));
++	if (ft_crc(rx + 1, len) != want) {
++		return EBADMSG;
++	}
++	memcpy(out, rx + 1, len);
++	return 0;
++}
++
++static int
++ft_read_reg(uint8_t reg, uint8_t *out, unsigned len)
++{
++	uint8_t cmd[5] = {0xc0, 0xa0u | 3u, reg, (uint8_t)(len >> 8), (uint8_t)len};
++	int err = ft_wait_idle();
++	if (!err) {
++		err = spi_packet(cmd, NULL, sizeof(cmd));
++	}
++	if (!err) {
++		err = ft_wait_idle();
++	}
++	return err ? err : ft_data(out, len);
++}
++
++static bool
++spi_se_init(void)
++{
++	uint32_t rx = touch_rd(st.se, SE_HW_RX);
++	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET TOUCH: SE2 already busy; probes skipped\n");
++		return false;
++	}
++	touch_wr(st.se, 0xe18, 0);
++	touch_wr(st.se, 0xe1c, 0);
++	touch_wr(st.se, 0x644, 0);
++	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
++	touch_wr(st.se, 0x648, 0xffffffffu);
++	touch_wr(st.se, SE_DMA, 0);                      /* FIFO mode */
++	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
++	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
++	touch_wr(st.se, 0x24, 0x7f);
++	touch_wr(st.se, 0x20, 1);
++	touch_wr(st.se, SE_CLK_SEL, 0);
++	touch_wr(st.se, SE_MCLK, (4u << 4) | 1u);        /* 19.2 MHz / 4 = 4.8 MHz */
++	touch_wr(st.se, SPI_LOOPBACK, 0);
++	touch_wr(st.se, SPI_DEMUX_SEL, 0);               /* CS0 */
++	touch_wr(st.se, SPI_CPHA, 1);                    /* SPI_MODE_1 */
++	touch_wr(st.se, SPI_CPOL, 0);
++	touch_wr(st.se, SPI_DEMUX_INV, 0);
++	touch_wr(st.se, SPI_DELAYS, 0);
++	touch_wr(st.se, SPI_WORD_LEN, 8u - 4u);
++	touch_wr(st.se, 0x254, 0);
++	touch_wr(st.se, 0x260, SE_PACK0);                /* 8-bit words, MSB first */
++	touch_wr(st.se, 0x264, SE_PACK1);
++	touch_wr(st.se, 0x284, SE_PACK0);
++	touch_wr(st.se, 0x288, SE_PACK1);
++	touch_wr(st.se, SE_TX_WM, 0);
++	touch_wr(st.se, 0x810, 0);
++	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
++	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET TOUCH: inherited FIFO data; probes skipped\n");
++		return false;
++	}
++	return true;
++}
++
++static int
++touch_ft8719(void)
++{
++	uint8_t f[FT_FRAME + 1];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0, seen = 0;
++	f[0] = 0;
++	int err = ft_data(f + 1, FT_FRAME);
++	if (err) {
++		return err;
++	}
++	if ((f[1] & 0xf0u) != 0x90u) {
++		return EIO;
++	}
++	st.s_frames++;
++	unsigned n = f[2] & 15u;
++	if (n > TOUCH_MAX) {
++		touch_report(0, x, y);
++		return 0;
++	}
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		const uint8_t *p = f + 3u + 6u * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= TOUCH_MAX) {
++			break;
++		}
++		if (seen & (1u << id)) {
++			return EIO;
++		}
++		seen |= 1u << id;
++		if (event == 1u || event == 3u) {
++			continue;       /* up / no event */
++		}
++		int px = (int)(((p[0] & 15u) << 8) | p[1]);
++		int py = (int)(((p[2] & 15u) << 8) | p[3]);
++		if (px >= FT_PANEL_W || py >= FT_PANEL_H) {
++			continue;
++		}
++		mask |= 1u << id;
++		/*
++		 * SweetHID maps a 1080x2400 panel centred in 1125x2436 (y + 18); the
++		 * 2340-line ginkgo panel sits at y + 48 in the same canvas.
++		 */
++		x[id] = px;
++		y[id] = py + 30;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++/* ginkgo main loop; returns when the driver stops. */
++static void
++touch_ginkgo(void)
++{
++	st.stage = "spi init";
++	if (!spi_se_init()) {
++		return;
++	}
++	/* qup02 SPI pins (6 MISO, 7 MOSI, 8 CLK, 9 CS), 6 mA, no pull; IRQ input pull-up. */
++	for (unsigned pin = 6; pin <= 9; ++pin) {
++		touch_gpio(pin, 1, 0, 2, false, false);
++	}
++	touch_gpio(FT_PIN_IRQ, 0, 3, 3, false, false);
++	printf("SWEET TOUCH: ginkgo FT8719 over SPI, reset=%#x irq=%#x\n",
++	    touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_RESET)),
++	    touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_IRQ)));
++	st.stage = "probe";
++	uint8_t id1 = 0, id2 = 0, fw = 0;
++	int e1 = ft_read_reg(0xa3, &id1, 1);
++	int e2 = ft_read_reg(0x9f, &id2, 1);
++	int e3 = ft_read_reg(0xa6, &fw, 1);
++	printf("SWEET TOUCH: FT8719 chip-id=%02x:%02x (err %d/%d) fw=%02x (err %d)\n",
++	    id1, id2, e1, e2, fw, e3);
++	if (e1 || id1 != 0x87) {
++		/*
++		 * Firmware not answering: one reset pulse on GPIO87 (Linux
++		 * fts_reset_proc: low 1 ms, high, wait 200 ms), then retry once.
++		 */
++		touch_gpio(FT_PIN_RESET, 0, 0, 3, true, false);
++		touch_wait(2);
++		touch_gpio(FT_PIN_RESET, 0, 0, 3, true, true);
++		touch_wait(200);
++		e1 = ft_read_reg(0xa3, &id1, 1);
++		printf("SWEET TOUCH: after reset chip-id=%02x (err %d)\n", id1, e1);
++		if (e1 || id1 != 0x87) {
++			printf("SWEET TOUCH: no FT8719; stopping\n");
++			return;
++		}
++	}
++	st.kind = TOUCH_FTS;
++	st.stage = "polling";
++	printf("SWEET TOUCH: polling FT8719, %dx%d, 10 ms\n", FT_PANEL_W, FT_PANEL_H);
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		if (!st.irq_hint || st.active ||
++		    !(touch_rd(st.west, TOUCH_GPIO_IO(FT_PIN_IRQ)) & 1u) ||
++		    (++ticks % 10u) == 0) {
++			int err = touch_ft8719();
++			if (err) {
++				st.s_errs++;
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET TOUCH: frame err=%d irq=%#x\n", err, st.irq_status);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y);
++				}
++			} else {
++				errors = 0;
++			}
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -637,6 +970,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks()) {
+ 		goto out;
+ 	}
++	if (((touch_rd(st.se, SE_FW) >> 8) & 0xffu) == 1u) {
++		touch_ginkgo();         /* SE2 loaded as SPI: ginkgo FT8719 */
++		goto out;
++	}
+ 	st.stage = "se2 init";
+ 	if (!touch_se_init()) {
+ 		goto out;
