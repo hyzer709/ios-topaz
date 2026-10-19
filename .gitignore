@@ -8,3 +8,9 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+*.img
+*.simg
+*.log
+research/
+finish-root.sh
+shim/out/

@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4cbe94a..1a213bd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -332,6 +332,18 @@ AppleCLCD::start(IOService *provider)
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+ 		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
+ 	}
++	/*
++	 * ginkgo debugging: sweetfb_noflip=1 never moves the MDP scanout away from
++	 * the boot framebuffer, so the kernel console stays visible even if the
++	 * flip does not take effect on this display pipe.
++	 */
++	uint32_t noflip = 0;
++	(void)PE_parse_boot_argn("sweetfb_noflip", &noflip, sizeof(noflip));
++	if (noflip && fVig0 != NULL) {
++		IOLog("SWEET FB: sweetfb_noflip=1, staying on the boot framebuffer (VIG0 src %#x)\n",
++		    fVig0[0x14 / 4]);
++		fVig0 = NULL;
++	}
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
