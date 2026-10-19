@@ -28,6 +28,8 @@ MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
 # 0x1_40000000, so the kernel gets that block. Panel 1080x2340, eMMC (no UFS).
 GINKGO_PHYS_BASE, GINKGO_MEM_SIZE = 0x80000000, 0xc0000000
 GINKGO_FB_H = 2340
+# eMMC host sdhci@4744000 ("hc_mem"); bsd/dev/sweet_ufs.c re-initializes it.
+GINKGO_SDHCI, GINKGO_SDHCI_SIZE = 0x04744000, 0x1000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -215,6 +217,13 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gink
         ('reg', u64(UFS, UFS_SIZE)),
     ])
 
+    # ginkgo: eMMC instead of UFS (same driver, SDHCI backend)
+    sdhci = node('sweet-sdhci', [
+        ph(),
+        ('compatible', cstr('qcom,sdhci-msm-v5')),
+        ('reg', u64(GINKGO_SDHCI, GINKGO_SDHCI_SIZE)),
+    ])
+
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
     # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
@@ -246,7 +255,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, gink
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or ginkgo else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [sdhci] if ginkgo else [ufs]))
 
 
 if __name__ == '__main__':
