@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 0d3a8a1..47160e2 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -968,7 +968,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.stage = "map";
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE2\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x80000);
+-	st.west = ml_io_map(TOUCH_WEST_PA, 0x58000);
++	st.west = ml_io_map(TOUCH_WEST_PA, 0x60000);  /* ginkgo: up to GPIO 95 (IRQ is GPIO88) */
+ 	st.east = ml_io_map(TOUCH_EAST_PA, 0x25000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.west || !st.east || !st.se) {
