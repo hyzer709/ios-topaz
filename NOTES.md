@@ -1,5 +1,14 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## ginkgo touch handoff (2026-10-19)
+
+Observed on the phone (boot with 0205): FT8719 answers in its boot ROM (status 00 00, boot ID 87 19 with valid CRC); app registers time out (err 60). So the SPI transport (mode 1, CS active low, first byte + rest with GENI FRAGMENTATION) works at least for 1+4-byte packets. Interpretation: no app firmware loaded (Android's driver downloads it to RAM on every boot).
+
+0206 (not yet built or run): RAM download per LineageOS sm6125 8aaa002b drivers/input/touchscreen/ft8719_spi_c3j (focaltech_flash.c fts_fw_write_start, focaltech_spi.c). ft_wait_idle now uses 0x00 in boot ROM / 0x01 with the app (ft_running). Steps: reset 5 ms, 8 ms, 55, 8 ms, read 90 -> 87 19 (5 resets x 3); AE addr24 len16 + data in 4092-byte packets, 3 ms each (no fast-download); ECC CC/CE/CD over the first packet, then over the whole app; 08 only if both match; then 0xa3 must read 87 within 1 s. Image from payload: `tools/mkpayload.py --touchfw FILE` -> ADT /chosen/memory-map TouchFirmware <pa, exact size>, read with IODTGetLoaderInfo + ml_static_ptovirt. Boot-arg sweettouchfw=0 skips it.
+Expected log for fw_huaxing_v09.bin (sha256 7406fbcd...5dfc, app 0xfaf4 = 64244 bytes): host ecc 5d29 full, cb65 over the first 4092 bytes. A tp/host mismatch on the first packet points at the transport (CS between 32-byte chunks), not the image.
+Checked offline only: patch chain 0060..0206 applies to sweet_touch.c; clang -fsyntax-only -Wall -Wextra -Wconversion with stub headers is clean; ECC matches a Python port of fts_ecc_cal_host; mkpayload --touchfw places the image and the ADT entry correctly (fake Mach-O). NOT built in CI, NOT run on the phone.
+Open: panel = Huaxing not proven (LineageOS ginkgo only ships huaxing fw for FT8719; the Novatek NT36672A variant is a different panel); firmware licence unclear (keep it out of git/artifacts); RECOVERY.md describes topaz, not ginkgo; tools/kbuild.sh hardcodes MakrSas/ios-topaz + branch topaz.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

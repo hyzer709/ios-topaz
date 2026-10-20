@@ -1,0 +1,348 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 2bbf786..3d9f611 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -672,14 +672,22 @@ ft_crc(const uint8_t *p, unsigned n)
+ 	return crc;
+ }
+ 
++/*
++ * Status byte bit0 = application firmware running, bit7 = busy. Idle means
++ * (status & 0x81) == 0x01 with the app running but == 0x00 in the boot ROM
++ * (Linux fts_wait_idle, fw_is_running). Only the RAM loader clears this.
++ */
++static bool ft_running = true;
++
+ static int
+ ft_wait_idle(void)
+ {
+ 	static const uint8_t cmd[2] = {0x05, 0xff};
+ 	uint8_t v[2];
+-	for (unsigned i = 0; i < 100; ++i) {
++	const uint8_t idle = ft_running ? 0x01u : 0x00u;
++	for (unsigned i = 0; i < 100 && !st.dead; ++i) {
+ 		delay(150);
+-		if (spi_packet(cmd, v, 2) == 0 && (v[1] & 0x81u) == 0x01u) {
++		if (spi_packet(cmd, v, 2) == 0 && (v[1] & 0x81u) == idle) {
+ 			return 0;
+ 		}
+ 	}
+@@ -722,6 +730,292 @@ ft_read_reg(uint8_t reg, uint8_t *out, unsigned len)
+ 	return err ? err : ft_data(out, len);
+ }
+ 
++/*
++ * FT8719 boot ROM: download the application into program RAM and start it.
++ * Protocol from Xiaomi/FocalTech focaltech_flash.c + focaltech_spi.c
++ * (LineageOS android_kernel_xiaomi_sm6125 8aaa002b, drivers/input/
++ * touchscreen/ft8719_spi_c3j, GPL-2.0, Copyright (c) 2012-2019 Focaltech
++ * Ltd., (C) 2019 XiaoMi, Inc.), reimplemented for XNU: same packets, delays
++ * and checks; the Linux spi/mutex/kmalloc plumbing is not used.
++ * RAM only: nothing is written to the IC's flash. The image comes from the
++ * boot payload (tools/mkpayload.py --touchfw, ADT /chosen/memory-map
++ * "TouchFirmware"); it is never part of the kernel or this repository.
++ */
++#define FT_CMD_MAX        11u         /* FTX_MAX_COMMMAND_LENGTH 16 - header 4 - 1 */
++#define FT_BOOT_ID_H      0x87u
++#define FT_BOOT_ID_L      0x19u
++#define FT_APPINFO        0x100u      /* code length, ~code length (big endian) */
++#define FT_APP_MIN        0x120u
++#define FT_APP_MAX        (64u * 1024u)
++#define FT_PRAM_PACKET    (4u * 1024u - 4u) /* SPI_LOW: no fast-download */
++#define FT_BOOT_RESETS    5u
++extern int IODTGetLoaderInfo(const char *key, void **infoAddr, int *infoSize);
++
++/* Command packet: c0 <ctrl | n> cmd[0..n-1]. ctrl 00 = write, a0 = read + CRC. */
++static int
++ft_cmd(uint8_t ctrl, const uint8_t *cmd, unsigned n)
++{
++	uint8_t tx[2u + FT_CMD_MAX];
++	if (n == 0 || n > FT_CMD_MAX) {
++		return EINVAL;
++	}
++	tx[0] = 0xc0;
++	tx[1] = (uint8_t)(ctrl | (n & 0x0fu));
++	memcpy(tx + 2, cmd, n);
++	return spi_packet(tx, NULL, n + 2u);
++}
++
++/* Write-only packet of any length: head byte, 30 us, data, CS high 150 us. */
++static int
++spi_write_packet(uint8_t head, const uint8_t *data, unsigned len)
++{
++	int err = spi_chunk(&head, NULL, 1, len > 0);
++	if (!err && len) {
++		delay(30);
++		for (unsigned off = 0; off < len && !err; off += SPI_CHUNK) {
++			unsigned n = len - off < SPI_CHUNK ? len - off : SPI_CHUNK;
++			err = spi_chunk(data + off, NULL, n, off + n < len);
++		}
++	}
++	delay(150);
++	return err;
++}
++
++/* Linux fts_read with the length bytes left out (boot ROM commands). */
++static int
++ft_boot_read(uint8_t op, uint8_t *out, unsigned len)
++{
++	int err = ft_wait_idle();
++	if (!err) {
++		err = ft_cmd(0xa0, &op, 1);
++	}
++	if (!err) {
++		err = ft_wait_idle();
++	}
++	return err ? err : ft_data(out, len);
++}
++
++/* Linux fts_boot_write with fw_is_running false: command, then raw data. */
++static int
++ft_boot_write(const uint8_t *cmd, unsigned n, const uint8_t *data, unsigned len)
++{
++	int err = ft_wait_idle();
++	if (!err) {
++		err = ft_cmd(0x00, cmd, n);
++	}
++	if (!err && data && len) {
++		err = ft_wait_idle();
++		if (!err) {
++			err = spi_write_packet(0x3f, data, len);
++		}
++	}
++	return err;
++}
++
++/* AL2 FCS over big-endian 16-bit words (fts_ecc_cal_host); n is even. */
++static uint16_t
++ft_ecc(const uint8_t *p, unsigned n)
++{
++	uint16_t ecc = 0;
++	for (unsigned i = 0; i + 1u < n; i += 2) {
++		ecc ^= (uint16_t)(((unsigned)p[i] << 8) | p[i + 1u]);
++		for (unsigned b = 0; b < 16; ++b) {
++			ecc = (ecc & 1u) ? (uint16_t)((ecc >> 1) ^ 0x8408u) : (uint16_t)(ecc >> 1);
++		}
++	}
++	return ecc;
++}
++
++/* fts_ecc_cal_tp: CC addr24 len24, poll CE until 00, read CD (big endian). */
++static int
++ft_ecc_tp(uint32_t addr, uint32_t len, uint16_t *ecc)
++{
++	const uint8_t cmd[7] = {0xcc, (uint8_t)(addr >> 16), (uint8_t)(addr >> 8), (uint8_t)addr,
++		                (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len};
++	uint8_t v[2] = {0xff, 0xff};
++	int err = ft_boot_write(cmd, sizeof(cmd), NULL, 0);
++	if (err) {
++		return err;
++	}
++	touch_wait(3);
++	unsigned i;
++	for (i = 0; i < 100; ++i) {
++		err = ft_boot_read(0xce, v, 1);
++		if (err) {
++			return err;
++		}
++		if (v[0] == 0) {
++			break;
++		}
++		touch_wait(1);
++	}
++	if (i == 100) {
++		printf("SWEET TOUCH: ecc busy %02x\n", v[0]);
++		return ETIMEDOUT;
++	}
++	err = ft_boot_read(0xcd, v, 2);
++	if (!err) {
++		*ecc = (uint16_t)((v[0] << 8) | v[1]);
++	}
++	return err;
++}
++
++/* fts_enter_into_boot: reset (low 5 ms), 8 ms, 55, 8 ms, boot ID 87 19. */
++static int
++ft_enter_boot(void)
++{
++	static const uint8_t start = 0x55;
++	uint8_t id[2] = {0, 0};
++	int err = EIO;
++	ft_running = false;
++	for (unsigned r = 0; r < FT_BOOT_RESETS && !st.dead; ++r) {
++		touch_gpio(FT_PIN_RESET, 0, 0, 3, true, false);
++		touch_wait(5);
++		touch_gpio(FT_PIN_RESET, 0, 0, 3, true, true);
++		touch_wait(8);
++		for (unsigned j = 0; j < 3 && !st.dead; ++j) {
++			err = ft_boot_write(&start, 1, NULL, 0);
++			if (err) {
++				continue;
++			}
++			touch_wait(8);
++			id[0] = id[1] = 0;
++			err = ft_boot_read(0x90, id, 2);
++			if (!err && id[0] == FT_BOOT_ID_H && id[1] == FT_BOOT_ID_L) {
++				return 0;
++			}
++			if (!err) {
++				err = ENODEV;
++			}
++		}
++	}
++	printf("SWEET TOUCH: boot ROM not entered err=%d id=%02x %02x\n", err, id[0], id[1]);
++	return err;
++}
++
++/* fts_pram_write: AE addr24 len16, then the data; fw[from..to) to RAM at from. */
++static int
++ft_pram_write(const uint8_t *fw, uint32_t from, uint32_t to)
++{
++	for (uint32_t off = from; off < to; off += FT_PRAM_PACKET) {
++		uint32_t n = to - off < FT_PRAM_PACKET ? to - off : FT_PRAM_PACKET;
++		const uint8_t cmd[6] = {0xae, (uint8_t)(off >> 16), (uint8_t)(off >> 8), (uint8_t)off,
++			                (uint8_t)(n >> 8), (uint8_t)n};
++		int err = ft_boot_write(cmd, sizeof(cmd), fw + off, n);
++		if (err) {
++			printf("SWEET TOUCH: pram write at %#x err=%d\n", off, err);
++			return err;
++		}
++		touch_wait(3);      /* no fast-download: 3 ms per packet */
++	}
++	return 0;
++}
++
++static int
++ft_ecc_check(const uint8_t *fw, uint32_t len)
++{
++	uint16_t tp = 0, host = ft_ecc(fw, len);
++	int err = ft_ecc_tp(0, len, &tp);
++	printf("SWEET TOUCH: pram ecc over %u bytes: tp=%04x host=%04x err=%d\n",
++	    (unsigned)len, tp, host, err);
++	return err ? err : (tp == host ? 0 : EILSEQ);
++}
++
++/*
++ * One download attempt (fts_fw_write_start). The app is started (08) only
++ * after the IC's ECC over program RAM equals the host's. The first packet is
++ * checked on its own first, so a transport fault (e.g. CS released between
++ * FIFO chunks) shows up early as an explicit ECC mismatch.
++ */
++static int
++ft_fw_write_start(const uint8_t *fw, uint32_t app)
++{
++	static const uint8_t start = 0x08;
++	uint32_t first = app < FT_PRAM_PACKET ? app : FT_PRAM_PACKET;
++	int err = ft_enter_boot();
++	if (!err) {
++		err = ft_pram_write(fw, 0, first);
++	}
++	if (!err) {
++		err = ft_ecc_check(fw, first);
++	}
++	if (!err && app > first) {
++		err = ft_pram_write(fw, first, app);
++		if (!err) {
++			err = ft_ecc_check(fw, app);
++		}
++	}
++	if (err) {
++		return err;
++	}
++	err = ft_boot_write(&start, 1, NULL, 0);
++	if (err) {
++		printf("SWEET TOUCH: start app (08) err=%d\n", err);
++	}
++	return err;
++}
++
++/*
++ * Find, validate and download the app image, then wait for the app: reg
++ * 0xa3 = 0x87 with status bit0 set. On any failure the app is not started
++ * and the IC is left in (or reset back to) its boot ROM.
++ */
++static int
++ft_fw_load(void)
++{
++	void *pa = NULL;
++	int size = 0;
++	if (IODTGetLoaderInfo("TouchFirmware", &pa, &size) != 0 || pa == NULL || size <= 0) {
++		printf("SWEET TOUCH: no TouchFirmware in the payload (mkpayload.py --touchfw)\n");
++		return ENOENT;
++	}
++	const uint8_t *fw = (const uint8_t *)ml_static_ptovirt((vm_offset_t)pa);
++	uint32_t fsize = (uint32_t)size;
++	if (fw == NULL || fsize < FT_APPINFO + 4u) {
++		printf("SWEET TOUCH: TouchFirmware too small (%u)\n", (unsigned)fsize);
++		return EINVAL;
++	}
++	uint32_t app = ((uint32_t)fw[FT_APPINFO] << 8) | fw[FT_APPINFO + 1u];
++	uint32_t napp = ((uint32_t)fw[FT_APPINFO + 2u] << 8) | fw[FT_APPINFO + 3u];
++	if (app + napp != 0xffffu || app < FT_APP_MIN || app > FT_APP_MAX || app > fsize ||
++	    (app & 1u)) {
++		printf("SWEET TOUCH: TouchFirmware %u bytes: bad app length %#x/%#x; not downloading\n",
++		    (unsigned)fsize, (unsigned)app, (unsigned)napp);
++		return EINVAL;
++	}
++	printf("SWEET TOUCH: TouchFirmware %u bytes at %p, app %u bytes, host ecc %04x\n",
++	    (unsigned)fsize, pa, (unsigned)app, ft_ecc(fw, app));
++	int err = EIO;
++	for (unsigned attempt = 1; attempt <= 3 && !st.dead; ++attempt) {
++		err = ft_fw_write_start(fw, app);
++		printf("SWEET TOUCH: download attempt %u err=%d\n", attempt, err);
++		if (!err) {
++			break;
++		}
++	}
++	ft_running = true;
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < 20 && !st.dead; ++i) {
++		uint8_t id = 0;
++		touch_wait(50);
++		err = ft_read_reg(0xa3, &id, 1);
++		if (!err && id == FT_BOOT_ID_H) {
++			uint8_t fwv = 0;
++			(void)ft_read_reg(0xa6, &fwv, 1);
++			printf("SWEET TOUCH: app running after %u ms: chip-id=%02x fw=%02x\n",
++			    50u * (i + 1u), id, fwv);
++			return 0;
++		}
++		if (!err) {
++			err = ENODEV;
++		}
++	}
++	printf("SWEET TOUCH: app did not come up err=%d\n", err);
++	return err;
++}
++
+ static bool
+ spi_se_init(void)
+ {
+@@ -878,6 +1172,25 @@ touch_ginkgo(void)
+ 	int e3 = ft_read_reg(0xa6, &fw, 1);
+ 	printf("SWEET TOUCH: FT8719 chip-id=%02x:%02x (err %d/%d) fw=%02x (err %d)\n",
+ 	    id1, id2, e1, e2, fw, e3);
++	int load = 1;
++	(void)PE_parse_boot_argn("sweettouchfw", &load, sizeof(load));
++	if ((e1 || id1 != 0x87) && load) {
++		/*
++		 * No app firmware (the IC sits in its boot ROM until the host
++		 * loads one, as Android's driver does on every boot): download
++		 * it to program RAM if the payload carries an image.
++		 */
++		st.stage = "fw download";
++		int el = ft_fw_load();
++		if (el != ENOENT) {
++			if (el) {
++				printf("SWEET TOUCH: firmware download failed (%d); stopping\n", el);
++				return;
++			}
++			e1 = 0;
++			id1 = 0x87;
++		}
++	}
+ 	if (e1 || id1 != 0x87) {
+ 		/*
+ 		 * Firmware not answering: one reset pulse on GPIO87 (Linux

@@ -25,6 +25,11 @@ kernel_end past it, so the shim needs no changes: the image lands below the
 ADT and boot_args, inside topOfKernelData (never handed to the VM), and the
 ADT gets /chosen/memory-map "RAMDisk" = <phys, size> for IOFindBSDRoot to
 turn into md0 (boot with rd=md0).
+
+--touchfw does the same for a touch controller firmware image (ginkgo FT8719,
+e.g. fw_huaxing_v09.bin): one more segment after the kernel/ramdisk and
+/chosen/memory-map "TouchFirmware" = <phys, exact byte size>. The image only
+goes into this payload; keep it out of git and out of CI artifacts.
 """
 import argparse, os, struct, sys
 
@@ -122,14 +127,18 @@ def decode(raw, fmt, image_base):
     raise ValueError(f'unsupported chained pointer format {fmt}')
 
 
-def add_ramdisk_to_adt(adt_blob, phys, size):
-    """Return the ADT with /chosen/memory-map RAMDisk = <phys, size> (two uintptr_t)."""
+def add_loader_info(adt_blob, key, phys, size):
+    """Return the ADT with /chosen/memory-map KEY = <phys, size> (two uintptr_t, IODTGetLoaderInfo)."""
     root, _ = adt.parse(adt_blob)
     chosen = next(c for c in root.children if c.name == 'chosen')
     mmap = next(c for c in chosen.children if c.name == 'memory-map')
-    assert mmap.prop('RAMDisk') is None, 'ADT already has a RAMDisk'
-    mmap.props.append(('RAMDisk', 0, struct.pack('<2Q', phys, size)))
+    assert mmap.prop(key) is None, f'ADT already has {key}'
+    mmap.props.append((key, 0, struct.pack('<2Q', phys, size)))
     return adt.serialize(root)
+
+
+def add_ramdisk_to_adt(adt_blob, phys, size):
+    return add_loader_info(adt_blob, 'RAMDisk', phys, size)
 
 
 def adt_dram(adt_blob):
@@ -140,7 +149,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, touchfw_path=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -167,6 +176,17 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
         pieces.append((rd_va, rd_size, image))
         adt_blob = add_ramdisk_to_adt(adt_blob, rd_pa, rd_size)
         ramdisk = (hex(rd_pa), hex(rd_size))
+    touchfw = None
+    if touchfw_path:
+        image = open(touchfw_path, 'rb').read()
+        assert 0x104 <= len(image) <= 0x20000, 'touch firmware size out of range'
+        fw_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        fw_va = kernel_end
+        kernel_end = fw_va + fw_size
+        fw_pa = fw_va - virt_base + PHYS_BASE
+        pieces.append((fw_va, fw_size, image))
+        adt_blob = add_loader_info(adt_blob, 'TouchFirmware', fw_pa, len(image))
+        touchfw = (hex(fw_pa), hex(len(image)))
 
     hdr_size = SEG_TABLE + 32 * len(pieces)
     out = bytearray(hdr_size)
@@ -188,7 +208,7 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     for i, t in enumerate(seg_table):
         struct.pack_into('<4Q', out, SEG_TABLE + 32 * i, *t)
     info = dict(cputype=hex(m['cputype']), cpusub=m['cpusub'], fixups=nfix, virt_base=hex(virt_base),
-                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, size=len(out),
+                entry=hex(m['entry']), kernel_end=hex(kernel_end), ramdisk=ramdisk, touchfw=touchfw, size=len(out),
                 segs=[(s['name'], hex(s['vmaddr']), hex(s['vmsize'])) for s in segs])
     return bytes(out), info
 
@@ -198,8 +218,9 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--touchfw', help='touch IC firmware image (ADT memory-map TouchFirmware)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk, a.touchfw)
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

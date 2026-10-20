@@ -55,6 +55,7 @@ Por cima do kernel XNU de código aberto da Apple (xnu-8796) roda o **sistema do
 | `xnu/patches/0200-ginkgo-emmc.patch` | Backend eMMC/SDHCI no driver de disco (`ufsroot0`) |
 | `xnu/patches/0201-ginkgo-fb-noflip.patch` | `sweetfb_noflip=1`: mantém o scanout no framebuffer do boot |
 | `xnu/patches/0202`–`0205` | Driver SPI do toque FT8719 e diagnósticos |
+| `xnu/patches/0206-ginkgo-ft8719-pram-download.patch` | Carrega o firmware do toque na RAM do FT8719 (boot ROM, `0x55`/`0xAE`/ECC `0xCC`/`0x08`), só se o payload trouxer a imagem |
 
 ## Como montar
 
@@ -91,6 +92,16 @@ fastboot boot shim/out/shim-ginkgo.img
 | `sweettouch=0` | Desliga o driver de toque |
 | `sweettouchdelay=N` | Espera N segundos antes de iniciar o toque |
 | `sweettouchdiag=1` | Congela a tela com um resumo se o driver de toque parar |
+| `sweettouchfw=0` | Não carrega o firmware do toque mesmo que o payload traga a imagem |
+
+### Firmware do toque (teste)
+
+O FT8719 fica no boot ROM até o host carregar o firmware na RAM dele (não grava a flash). O patch 0206 faz isso a partir de uma imagem passada ao `mkpayload.py`:
+```
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/ginkgo.adt shim/out/payload.bin \
+  --touchfw /caminho/fora/do/repo/fw_huaxing_v09.bin --cmdline '...'
+```
+A imagem vai só para o `payload.bin`/boot image local. **Não versione o firmware nem o publique em artefatos**: o arquivo não tem licença explícita. Sem `--touchfw` o comportamento é o de antes.
 
 ### Observações
 
