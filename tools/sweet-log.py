@@ -12,13 +12,15 @@ import struct, sys
 
 data = open(sys.argv[1], 'rb').read()
 # topaz (UFS, 4 KiB blocks): header at 0, ring at 4096. ginkgo (eMMC, 512-byte
-# blocks): the area is 1 + ring/512 blocks, so in the 4 KiB-block dump of
-# sweet-log-pull.sh the header sits 3584 bytes in and the ring follows 512 later.
-for hdr, blk in ((0, 4096), (3584, 512)):
-    if data[hdr:hdr + 8] == b'SWEETLOG':
-        break
+# blocks): header one 512-byte block before the ring, a few KiB into the dump
+# (where exactly depends on how the partition end lines up with 4 KiB).
+if data[:8] == b'SWEETLOG':
+    hdr, blk = 0, 4096
 else:
-    sys.exit('no SWEETLOG header (log never flushed, or wrong area)')
+    hdr = next((o for o in range(512, 0x10000, 512) if data[o:o + 8] == b'SWEETLOG'), None)
+    if hdr is None:
+        sys.exit('no SWEETLOG header (log never flushed, or wrong area)')
+    blk = 512
 magic, version, size, total, seq = struct.unpack_from('<8sIIQQ', data, hdr)
 ring = data[hdr + blk:hdr + blk + size]
 if total <= size:
