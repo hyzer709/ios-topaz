@@ -1,5 +1,10 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## ginkgo Wi-Fi step 2: WLAN (2026-10-21)
+
+Step 1 RESULT (kernel CI 39667383236 = 0cf8f13, image shim-ginkgo-0207, modem=1, log pulled from userdata via OrangeFox/TWRP + tools/sweet-log-pull.sh): the modem boots on ginkgo. init_image/mem_setup/auth_and_reset ret=0, "modem is up (MODEM READY)" t=21 ms after reset, GLINK + QRTR up, pd-mapper/tftp/rmtfs served (modemst1/modemst2/fsg read-only, rmtfs buffer 80003000+300000 assigned), ~20 modem services announced. Log header on eMMC sits 7168 bytes into the 4 KiB dump (sweet-log.py searches for it now).
+Step 2: 0127-0130 copied unchanged from MakrSas/ios-topaz topaz (89451b8): sweetbusy, IOKit quiesce (wifid hung boot), station + WPA2 join. Checked offline that the whole series still applies in name order (0207 after 0130) to sweet_ufs.c/TopazModem*/IOService/IOStartIOKit/files.arm64/SweetFramebuffer; no topaz addresses in 0129/0130. Test with modem=1 wifi=1.
+
 ## ginkgo Wi-Fi step 1: modem boot (2026-10-21)
 
 Touch works on the phone (0206 + --touchfw fw_huaxing_v09.bin, cpus=4, sweetfb_hz=60; README updated).
