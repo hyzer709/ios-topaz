@@ -26,7 +26,10 @@ MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
 # --ginkgo: Redmi Note 8 (SM6125 trinket, 4 GB). /proc/iomem on the phone shows
 # System RAM 0x80000000-0x13fffffff as one block (3 GiB) and no RAM at
 # 0x1_40000000, so the kernel gets that block. Panel 1080x2340, eMMC (no UFS).
-GINKGO_PHYS_BASE, GINKGO_MEM_SIZE = 0x80000000, 0xc0000000
+# Its first 32 MiB stay outside the kernel: 0x80000000-0x80ffffff is the modem/WLAN
+# pool of TopazModem.cpp (must be below 4 GiB and not kernel-managed); 32 MiB keeps
+# phys_base on the 32 MiB block the kernel mapping needs.
+GINKGO_PHYS_BASE, GINKGO_MEM_SIZE = 0x82000000, 0xbe000000
 GINKGO_FB_H = 2340
 # eMMC host sdhci@4744000 ("hc_mem"); bsd/dev/sweet_ufs.c re-initializes it.
 GINKGO_SDHCI, GINKGO_SDHCI_SIZE = 0x04744000, 0x1000
