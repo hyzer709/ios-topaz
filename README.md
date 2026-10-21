@@ -13,17 +13,16 @@ Por cima do kernel XNU de código aberto da Apple (xnu-8796) roda o **sistema do
 | Área | Situação |
 |---|---|
 | Boot | ABL da Xiaomi (desbloqueado) → `fastboot boot` do shim (boot image **v2**) → XNU |
-| CPU | Troca do núcleo Silver para o Gold `0x100` (os Silver não suportam páginas de 16K). Testado com `cpus=1`. Gold a 2016 MHz |
+| CPU | Troca do núcleo Silver para o Gold `0x100` (os Silver não suportam páginas de 16K). Funciona com `cpus=4` (SMP por PSCI); `cpus=1` também inicia, mas fica bem mais lento. Gold a 2016 MHz |
 | Memória | 3 GB em `0x80000000` (único bloco grande de RAM livre na versão de 4 GB) |
 | Armazenamento | **Driver novo de eMMC** (SDHCI 3.0, `sdhci@4744000`): reinicializa o cartão, barramento de 8 bits em high speed, leitura e gravação por **ADMA2**. A raiz do iOS é um volume HFS+ na `userdata` |
 | Tela | Framebuffer do ABL em `0x5c000000` (1080×2340), desenho por software. Apresentado ao iOS como a tela do iPhone X |
 | Interface | Maçã de boot, tela de bloqueio, Siri |
 | Botões | Power (segurar abre a Siri), Volume + e Volume − (o indicador de volume aparece) |
-| Toque | Barramento SPI funcionando e chip FT8719 respondendo o ID (`87 19`), mas **sem leitura de toque** (veja abaixo) |
+| Toque | **Funciona.** FT8719 via SPI (QUP0 SE2): o kernel carrega o firmware de toque na RAM do chip a cada boot (boot ROM `87 19`, envio em blocos de 4092 bytes, verificação de ECC antes de iniciar) e lê os toques por polling. Precisa da imagem do firmware no payload (veja *Firmware do toque*) |
 
 ## O que não funciona
 
-- **Toque.** O FT8719 da Huaxing é integrado à tela e fica no modo de inicialização até receber o firmware de toque. No Android, é o driver da Xiaomi que faz isso. Este port não faz.
 - **Wi-Fi, Bluetooth, rede celular, áudio, câmera, sensores e GPU.**
 - **Troca de buffer da tela.** A troca de scanout do MDP não tem efeito no ginkgo, então é preciso usar `sweetfb_noflip=1`. Com isso, o console e a interface compartilham o mesmo buffer.
 - **Relógio.** Sem RTC, a data começa em 31 de dezembro.
@@ -72,9 +71,11 @@ python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked
 ```
 python3 tools/mkadt.py shim/out/ginkgo.adt --ginkgo
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/ginkgo.adt shim/out/payload.bin \
-  --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweettouch=0 sweetbattery=0 sweetfb_noflip=1 sweetfb_noconsole=1 sweetfb_stayon=1'
+  --touchfw ~/ft8719-fw/fw_huaxing_v09.bin \
+  --cmdline 'debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=60 sweetbattery=0 sweetfb_noflip=1 sweetfb_noconsole=1 sweetfb_stayon=1'
 cd shim && ./build-ginkgo.sh ../shim/out/payload.bin
 ```
+`ufsrw=1 rootrw=1` são obrigatórios: sem eles a raiz não monta com escrita e o `launchd` entra em panic (`mount_hfs: Read-only file system`).
 
 **Gravar e iniciar:**
 ```
@@ -94,13 +95,19 @@ fastboot boot shim/out/shim-ginkgo.img
 | `sweettouchdiag=1` | Congela a tela com um resumo se o driver de toque parar |
 | `sweettouchfw=0` | Não carrega o firmware do toque mesmo que o payload traga a imagem |
 
-### Firmware do toque (teste)
+### Firmware do toque
 
-O FT8719 fica no boot ROM até o host carregar o firmware na RAM dele (não grava a flash). O patch 0206 faz isso a partir de uma imagem passada ao `mkpayload.py`:
+O FT8719 (integrado à tela Huaxing) fica no boot ROM até o host carregar o firmware na RAM dele; no Android, é o driver da Xiaomi que faz isso a cada boot. O patch 0206 faz o mesmo no XNU. Nada é gravado na flash do chip.
+
+A imagem testada é a `fw_huaxing_v09` do kernel do LineageOS para o ginkgo (commit `8aaa002b`), convertida de `.i` para binário:
 ```
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/ginkgo.adt shim/out/payload.bin \
-  --touchfw /caminho/fora/do/repo/fw_huaxing_v09.bin --cmdline '...'
+mkdir -p ~/ft8719-fw && cd ~/ft8719-fw
+curl -LO https://raw.githubusercontent.com/LineageOS/android_kernel_xiaomi_sm6125/8aaa002bfb7ba1cac2c02dbb42ae0259ef2e47ba/drivers/input/touchscreen/ft8719_spi_c3j/include/firmware/fw_huaxing_v09.i
+python3 -c "import re; t=open('fw_huaxing_v09.i').read(); open('fw_huaxing_v09.bin','wb').write(bytes(int(x,16) for x in re.findall(r'0x([0-9a-fA-F]{1,2})',t)))"
+sha256sum fw_huaxing_v09.bin   # 7406fbcd395a3ef8dcab098377938bc3ad83096db1979798d49902926b995dfc, 131072 bytes
 ```
+O `mkpayload.py --touchfw` coloca a imagem no payload e o kernel a encontra pelo ADT (`/chosen/memory-map` `TouchFirmware`). Sem `--touchfw`, o toque não funciona (o chip continua no boot ROM).
+
 A imagem vai só para o `payload.bin`/boot image local. **Não versione o firmware nem o publique em artefatos**: o arquivo não tem licença explícita. Sem `--touchfw` o comportamento é o de antes.
 
 ### Observações
