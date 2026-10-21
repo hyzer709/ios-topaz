@@ -11,10 +11,16 @@ the ring follows. Byte n of the console stream is at ring offset n % size.
 import struct, sys
 
 data = open(sys.argv[1], 'rb').read()
-magic, version, size, total, seq = struct.unpack_from('<8sIIQQ', data, 0)
-if magic != b'SWEETLOG':
+# topaz (UFS, 4 KiB blocks): header at 0, ring at 4096. ginkgo (eMMC, 512-byte
+# blocks): the area is 1 + ring/512 blocks, so in the 4 KiB-block dump of
+# sweet-log-pull.sh the header sits 3584 bytes in and the ring follows 512 later.
+for hdr, blk in ((0, 4096), (3584, 512)):
+    if data[hdr:hdr + 8] == b'SWEETLOG':
+        break
+else:
     sys.exit('no SWEETLOG header (log never flushed, or wrong area)')
-ring = data[4096:4096 + size]
+magic, version, size, total, seq = struct.unpack_from('<8sIIQQ', data, hdr)
+ring = data[hdr + blk:hdr + blk + size]
 if total <= size:
     text = ring[:total]
 else:
